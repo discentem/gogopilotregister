@@ -4,12 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+
+	//"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+
+	retry "github.com/avast/retry-go"
 
 	"github.com/StackExchange/wmi"
 
@@ -88,32 +94,27 @@ type AutopilotState struct {
 }
 
 type graphClient struct {
-	c http.Client
-	t azcore.AccessToken
-	v string
+	httpClient http.Client
+	token      azcore.AccessToken
+	base       string
+	vers       string
 }
 
 // Do adds the access token to Authorization header before calling graphClient.c.Do()
 // graphClient.c.Do() uses the http.Client that is inside graphClient
 func (c *graphClient) Do(req *http.Request) (*http.Response, error) {
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.t.Token))
-	return c.c.Do(req)
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.token.Token))
+	return c.httpClient.Do(req)
 }
 
 // NewGraphClient returns a *graphClient with a default http client and token set
 func NewGraphClient(tok azcore.AccessToken) (*graphClient, error) {
 	return &graphClient{
-		c: *http.DefaultClient,
-		t: tok,
-		v: "beta",
+		httpClient: *http.DefaultClient,
+		token:      tok,
+		base:       "https://graph.microsoft.com",
+		vers:       "beta",
 	}, nil
-}
-
-type ImportedWindowsAutopilotDeviceIdentityState struct {
-	DeviceImportStatus   string `json:"deviceImportStatus"`
-	DeviceRegistrationID string `json:"deviceRegistrationId"`
-	DeviceErrorCode      int    `json:"deviceErrorCode"`
-	DeviceErrorName      string `json:"deviceErrorName"`
 }
 
 type ImportedWindowsAutopilotDeviceIdentity struct {
@@ -127,47 +128,93 @@ type ImportedWindowsAutopilotDeviceIdentity struct {
 	AssignedUserPrincipalName string                                      `json:"assignedUserPrincipalName"`
 }
 
-func (c *graphClient) AlreadyRegistered(serial string) (bool, error) {
-	url := "https://graph.microsoft.com/v1.0/deviceManagement/importedWindowsAutopilotDeviceIdentities"
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return false, nil
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.Do(req)
-	if err != nil {
-		return false, err
-	}
-	body, _ := ioutil.ReadAll(resp.Body)
-	var identites struct {
-		Value []ImportedWindowsAutopilotDeviceIdentity `json:"value"`
-	}
-	if err := json.Unmarshal(body, &identites); err != nil {
-		return false, err
-	}
-	alreadyRegistered := false
-	for _, d := range identites.Value {
-		if d.SerialNumber == serial {
-			fmt.Println(d)
-			alreadyRegistered = true
-		}
-	}
-	return alreadyRegistered, nil
+type ImportedWindowsAutopilotDeviceIdentityState struct {
+	DeviceImportStatus   string `json:"deviceImportStatus"`
+	DeviceRegistrationID string `json:"deviceRegistrationId"`
+	DeviceErrorCode      int    `json:"deviceErrorCode"`
+	DeviceErrorName      string `json:"deviceErrorName"`
 }
 
-func (c *graphClient) RegisterAutopilotDevice() error {
+var (
+	errStatusUnknown = fmt.Errorf("DeviceImportStatus is %q", "unknown")
+)
+
+type ImportedWindowsAutopilotDeviceIdentityResp struct {
+	ODataContext string `json:"@odata.context"`
+	ImportedWindowsAutopilotDeviceIdentity
+}
+
+func (c *graphClient) ConfirmRegistered(id string) (bool, error) {
+	err := retry.Do(
+		func() error {
+			base := c.base
+			vers := c.vers
+			endpoint := fmt.Sprintf(
+				"deviceManagement/importedWindowsAutopilotDeviceIdentities/%s",
+				id,
+			)
+			url := fmt.Sprintf(
+				"%s/%s/%s",
+				base,
+				vers,
+				endpoint,
+			)
+			fmt.Println(url)
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				return errors.Wrapf(err, "crafting GET failed")
+			}
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := c.Do(req)
+			if err != nil {
+				return errors.Wrapf(err, "calling c.Do failed")
+			}
+			body, _ := ioutil.ReadAll(resp.Body)
+			var identity struct {
+				ODataContext      string                                      `json:"@odata.context"`
+				ID                string                                      `json:"id"`
+				ProductKey        string                                      `json:"productKey"`
+				SerialNumber      string                                      `json:"serialNumber"`
+				HardwareIdentifer string                                      `json:"hardwareIdentifier"`
+				Model             string                                      `json:"model"`
+				Manufacturer      string                                      `json:"manufacturer"`
+				State             ImportedWindowsAutopilotDeviceIdentityState `json:"state"`
+			}
+			if err := json.Unmarshal(body, &identity); err != nil {
+				return errors.Wrapf(err, "couldn't unmarhsal to identity")
+			}
+			fmt.Println(identity)
+			if identity.State.DeviceImportStatus == "unknown" || identity.State.DeviceImportStatus == "" {
+				return errStatusUnknown
+			}
+			fmt.Println(identity.State.DeviceImportStatus)
+			return nil
+		},
+		retry.Delay(time.Second*30),
+		retry.Attempts(uint(10)),
+		// Fixed delay instead of exponential backoff
+		retry.DelayType(retry.FixedDelay),
+		retry.RetryIf(func(err error) bool {
+			return err == errStatusUnknown
+		}),
+	)
+
+	return err != errStatusUnknown, nil
+}
+
+func (c *graphClient) RegisterAutopilotDevice() (*bool, error) {
 	cs, err := Win32CompSys()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	bios, err := Win32Bios()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mdmInfo, err := MDMDevDetail()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data, err := json.Marshal(struct {
 		ODataType         string         `json:"@odata.type"`
@@ -189,20 +236,30 @@ func (c *graphClient) RegisterAutopilotDevice() error {
 		},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req, _ := http.NewRequest("POST", "https://graph.microsoft.com/beta/deviceManagement/importedWindowsAutopilotDeviceIdentities/", bytes.NewBuffer(data))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	body, _ := ioutil.ReadAll(resp.Body)
 	fmt.Println(string(body))
 	fmt.Println(resp.StatusCode)
 	fmt.Println(resp.Status)
-	return nil
+	var identity ImportedWindowsAutopilotDeviceIdentity
+	if err := json.Unmarshal(body, &identity); err != nil {
+		return nil, err
+	}
+	fmt.Println(identity)
+	registered, err := c.ConfirmRegistered(identity.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &registered, nil
 
 }
 
@@ -260,7 +317,7 @@ func main() {
 		&CredFlowOptions{
 			TenantID:              tenantID,
 			ClientID:              clientID,
-			InteractiveCredential: true,
+			InteractiveCredential: false,
 			Scopes:                scopes,
 		},
 	)
@@ -273,22 +330,11 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	// bios, err := Win32Bios()
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	os.Exit(1)
-	// }
-	// registered, err := gc.AlreadyRegistered(bios.SerialNumber)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	os.Exit(1)
-	// }
-	// if !registered {
-
-	// }
-	if err := gc.RegisterAutopilotDevice(); err != nil {
+	registered, err := gc.RegisterAutopilotDevice()
+	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+	fmt.Printf("Success? %v", *registered)
 
 }
