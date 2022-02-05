@@ -191,13 +191,17 @@ func (c *graphClient) RegisterAutopilotDevice() error {
 	if err != nil {
 		return err
 	}
-	req, _ := http.NewRequest("POST", "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/", bytes.NewBuffer(data))
+	req, _ := http.NewRequest("POST", "https://graph.microsoft.com/beta/deviceManagement/importedWindowsAutopilotDeviceIdentities/", bytes.NewBuffer(data))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	_, err = c.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
+	body, _ := ioutil.ReadAll(resp.Body)
+	fmt.Println(string(body))
+	fmt.Println(resp.StatusCode)
+	fmt.Println(resp.Status)
 	return nil
 
 }
@@ -269,21 +273,22 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	bios, err := Win32Bios()
-	if err != nil {
+	// bios, err := Win32Bios()
+	// if err != nil {
+	// 	fmt.Println(err)
+	// 	os.Exit(1)
+	// }
+	// registered, err := gc.AlreadyRegistered(bios.SerialNumber)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// 	os.Exit(1)
+	// }
+	// if !registered {
+
+	// }
+	if err := gc.RegisterAutopilotDevice(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
-	}
-	registered, err := gc.AlreadyRegistered(bios.SerialNumber)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	if !registered {
-		if err := gc.RegisterAutopilotDevice(); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
 	}
 
 }
