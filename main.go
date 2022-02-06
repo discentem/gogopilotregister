@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 
 	"fmt"
 	"io/ioutil"
@@ -120,11 +121,11 @@ func NewGraphClient(ctx context.Context, opts graphClientOptions) (*graphClient,
 		if err := registry.SetInteger(`SOFTWARE\Policies\Microsoft\Edge`, `HideFirstRunExperience`, 1); err != nil {
 			logger.Warning("could not set HideFirstRunExperience")
 		}
-		logger.Info("HideFirstRunExperience = 1")
+		logger.V(2).Info("HideFirstRunExperience = 1")
 		if err := registry.SetInteger(`SOFTWARE\Policies\Microsoft\Edge`, `BrowserSignin`, 0); err != nil {
 			logger.Warning("could not set BrowserSignin")
 		}
-		logger.Info("BrowserSignin = 0")
+		logger.V(2).Info("BrowserSignin = 0")
 
 	}
 
@@ -281,6 +282,13 @@ func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error
 }
 
 func main() {
+	logLvl2 := flag.Bool("vv", false, "Sets log level")
+	flag.Parse()
+
+	defer logger.Init("gogopilotregister", true, true, ioutil.Discard).Close()
+	if *logLvl2 {
+		logger.SetLevel(2)
+	}
 	ctx := context.Background()
 	gc, err := NewGraphClient(context.Background(),
 		graphClientOptions{
