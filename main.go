@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 
-	//"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/google/logger"
+
+	"github.com/google/glazier/go/registry"
 
 	"github.com/discentem/gogopilotregister/wmi"
 
@@ -24,14 +27,7 @@ import (
 	azidentity "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
-type AutopilotState struct {
-	ODataType            string `json:"@odata.type"`
-	DeviceImportStatus   string `json:"deviceImportStatus"`
-	DeviceRegistrationID string `json:"deviceRegistrationId"`
-	DeviceErrorCode      int    `json:"deviceErrorCode"`
-	DeviceErrorName      string `json:"deviceErrorName"`
-}
-
+// graphClient lets you interact with MS Graph APIs: https://docs.microsoft.com/en-us/graph/api/overview?view=graph-rest-1.0
 type graphClient struct {
 	httpClient http.Client
 	cred       *azidentity.ChainedTokenCredential
@@ -52,8 +48,7 @@ type graphCredentialOptions struct {
 	Interactive bool
 }
 
-// Do adds the access token to Authorization header before calling graphClient.c.Do()
-// graphClient.c.Do() uses the http.Client that is inside graphClient
+// Do obtains a azcore.Accesstoken from c.cred, if necessary, and adds the token to Authorization header before calling graphClient.httpClient.Do().
 func (c *graphClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
 	if c.token == nil {
 		token, err := c.cred.GetToken(ctx, policy.TokenRequestOptions{
@@ -116,6 +111,21 @@ func NewGraphClient(ctx context.Context, opts graphClientOptions) (*graphClient,
 	cred, err := Cred(ctx, opts.TenantID, opts.ClientID, opts.CredentialOptions)
 	if err != nil {
 		return nil, err
+	}
+
+	if opts.CredentialOptions.Interactive {
+		if err := registry.Create(`SOFTWARE\Policies\Microsoft\Edge`); err != nil {
+			logger.Warning("could not create Edge key")
+		}
+		if err := registry.SetInteger(`SOFTWARE\Policies\Microsoft\Edge`, `HideFirstRunExperience`, 1); err != nil {
+			logger.Warning("could not set HideFirstRunExperience")
+		}
+		logger.Info("HideFirstRunExperience = 1")
+		if err := registry.SetInteger(`SOFTWARE\Policies\Microsoft\Edge`, `BrowserSignin`, 0); err != nil {
+			logger.Warning("could not set BrowserSignin")
+		}
+		logger.Info("BrowserSignin = 0")
+
 	}
 
 	return &graphClient{
@@ -215,6 +225,14 @@ func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error
 	if err != nil {
 		return nil, err
 	}
+	type AutopilotState struct {
+		ODataType            string `json:"@odata.type"`
+		DeviceImportStatus   string `json:"deviceImportStatus"`
+		DeviceRegistrationID string `json:"deviceRegistrationId"`
+		DeviceErrorCode      int    `json:"deviceErrorCode"`
+		DeviceErrorName      string `json:"deviceErrorName"`
+	}
+
 	data, err := json.Marshal(struct {
 		ODataType         string         `json:"@odata.type"`
 		SerialNumber      string         `json:"serialNumber"`
@@ -269,7 +287,7 @@ func main() {
 			TenantID: tenantID,
 			ClientID: clientID,
 			CredentialOptions: graphCredentialOptions{
-				Interactive: false,
+				Interactive: true,
 			},
 			Scopes: scopes,
 		},

@@ -7,6 +7,8 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v0.13.0
 	github.com/StackExchange/wmi v1.2.1
 	github.com/avast/retry-go v3.0.0+incompatible
+	github.com/google/glazier v0.0.0-20220124133323-a8667e45cb3d
+	github.com/google/logger v1.1.1
 	github.com/pkg/errors v0.9.1
 )
 
