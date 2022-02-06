@@ -1,4 +1,4 @@
-module azuregraph
+module github.com/discentem/gogopilotregister
 
 go 1.17
 
@@ -6,6 +6,8 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v0.21.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v0.13.0
 	github.com/StackExchange/wmi v1.2.1
+	github.com/avast/retry-go v3.0.0+incompatible
+	github.com/pkg/errors v0.9.1
 )
 
 require (

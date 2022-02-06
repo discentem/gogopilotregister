@@ -13,77 +13,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/discentem/gogopilotregister/wmi"
+
 	"github.com/pkg/errors"
 
 	retry "github.com/avast/retry-go"
-
-	"github.com/StackExchange/wmi"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	azidentity "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
-
-var (
-	// ErrWMIEmptyResult indicates a condition where WMI failed to return the expected values.
-	ErrWMIEmptyResult = errors.New("WMI returned without error, but zero results")
-)
-
-type Win32_Bios struct {
-	SerialNumber string
-}
-
-func Win32Bios() (*Win32_Bios, error) {
-	var result []Win32_Bios
-	if err := wmi.Query(wmi.CreateQuery(&result, ""), &result); err != nil {
-		return nil, err
-	}
-	if len(result) < 1 {
-		return nil, ErrWMIEmptyResult
-	}
-	return &result[0], nil
-}
-
-type Win32_ComputerSystem struct {
-	DNSHostName  string
-	Domain       string
-	DomainRole   int
-	Model        string
-	Manufacturer string
-}
-
-func Win32CompSys() (*Win32_ComputerSystem, error) {
-	var result []Win32_ComputerSystem
-	if err := wmi.Query(wmi.CreateQuery(&result, ""), &result); err != nil {
-		return nil, err
-	}
-	if len(result) < 1 {
-		return nil, ErrWMIEmptyResult
-	}
-	return &result[0], nil
-}
-
-type MDM_DevDetail_Ext01 struct {
-	DeviceHardwareData string
-}
-
-func MDMDevDetail() (*MDM_DevDetail_Ext01, error) {
-	var result []MDM_DevDetail_Ext01
-	if err := wmi.QueryNamespace(wmi.CreateQuery(&result, ""), &result, "root/cimv2/mdm/dmmap"); err != nil {
-		return nil, err
-	}
-	if len(result) < 1 {
-		return nil, ErrWMIEmptyResult
-	}
-	return &result[0], nil
-}
-
-type CredFlowOptions struct {
-	TenantID              string
-	ClientID              string
-	Scopes                []string
-	InteractiveCredential bool
-}
 
 type AutopilotState struct {
 	ODataType            string `json:"@odata.type"`
@@ -95,25 +34,95 @@ type AutopilotState struct {
 
 type graphClient struct {
 	httpClient http.Client
-	token      azcore.AccessToken
-	base       string
-	vers       string
+	cred       *azidentity.ChainedTokenCredential
+	token      *azcore.AccessToken
+	options    graphClientOptions
+}
+
+type graphClientOptions struct {
+	Base              string
+	Vers              string
+	TenantID          string
+	ClientID          string
+	Scopes            []string
+	CredentialOptions graphCredentialOptions
+}
+
+type graphCredentialOptions struct {
+	Interactive bool
 }
 
 // Do adds the access token to Authorization header before calling graphClient.c.Do()
 // graphClient.c.Do() uses the http.Client that is inside graphClient
-func (c *graphClient) Do(req *http.Request) (*http.Response, error) {
+func (c *graphClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if c.token == nil {
+		token, err := c.cred.GetToken(ctx, policy.TokenRequestOptions{
+			Scopes:   c.options.Scopes,
+			TenantID: c.options.TenantID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		c.token = token
+	}
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.token.Token))
 	return c.httpClient.Do(req)
 }
 
+func Cred(ctx context.Context, tenantID, ClientID string, opts graphCredentialOptions) (*azidentity.ChainedTokenCredential, error) {
+	credList := []azcore.TokenCredential{}
+	if opts.Interactive {
+		interactive, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+			TenantID: tenantID,
+			ClientID: clientID,
+			// Need to configure as desktop app redirect, not web redirect
+			// See https://github.com/Azure/azure-sdk-for-go/issues/16723#issuecomment-1004271528
+			RedirectURL: "http://localhost:9090",
+		})
+		if err != nil {
+			return nil, err
+		}
+		credList = append(credList, interactive)
+	}
+	// https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/azidentity/device_code_credential.go
+	deviceCode, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
+		TenantID: tenantID,
+		ClientID: clientID,
+		// Customizes the UserPrompt. Replaces VerificationURL with shortlink.
+		// Providing a custom UserPrompt can also allow the URL to be rewritten anywhere, instead of just stdout
+		UserPrompt: func(ctx context.Context, deviceCodeMessage azidentity.DeviceCodeMessage) error {
+			msg := strings.Replace(deviceCodeMessage.Message, "https://microsoft.com/devicelogin", "https://aka.ms/devicelogin", 1)
+			fmt.Println(msg)
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	credList = append(credList, deviceCode)
+	chain, err := azidentity.NewChainedTokenCredential(
+		credList,
+		&azidentity.ChainedTokenCredentialOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return chain, nil
+}
+
 // NewGraphClient returns a *graphClient with a default http client and token set
-func NewGraphClient(tok azcore.AccessToken) (*graphClient, error) {
+func NewGraphClient(ctx context.Context, opts graphClientOptions) (*graphClient, error) {
+
+	cred, err := Cred(ctx, opts.TenantID, opts.ClientID, opts.CredentialOptions)
+	if err != nil {
+		return nil, err
+	}
+
 	return &graphClient{
 		httpClient: *http.DefaultClient,
-		token:      tok,
-		base:       "https://graph.microsoft.com",
-		vers:       "beta",
+		cred:       cred,
+		token:      nil,
+		options:    opts,
 	}, nil
 }
 
@@ -139,24 +148,14 @@ var (
 	errStatusUnknown = fmt.Errorf("DeviceImportStatus is %q", "unknown")
 )
 
-type ImportedWindowsAutopilotDeviceIdentityResp struct {
-	ODataContext string `json:"@odata.context"`
-	ImportedWindowsAutopilotDeviceIdentity
-}
-
-func (c *graphClient) ConfirmRegistered(id string) (bool, error) {
+func (c *graphClient) ConfirmRegistered(ctx context.Context, id string) (bool, error) {
 	err := retry.Do(
 		func() error {
-			base := c.base
-			vers := c.vers
-			endpoint := fmt.Sprintf(
-				"deviceManagement/importedWindowsAutopilotDeviceIdentities/%s",
-				id,
-			)
+			endpoint := fmt.Sprintf("deviceManagement/importedWindowsAutopilotDeviceIdentities/%s", id)
 			url := fmt.Sprintf(
 				"%s/%s/%s",
-				base,
-				vers,
+				c.options.Base,
+				c.options.Vers,
 				endpoint,
 			)
 			fmt.Println(url)
@@ -166,7 +165,7 @@ func (c *graphClient) ConfirmRegistered(id string) (bool, error) {
 			}
 			req.Header.Set("Accept", "application/json")
 			req.Header.Set("Content-Type", "application/json")
-			resp, err := c.Do(req)
+			resp, err := c.Do(ctx, req)
 			if err != nil {
 				return errors.Wrapf(err, "calling c.Do failed")
 			}
@@ -203,16 +202,16 @@ func (c *graphClient) ConfirmRegistered(id string) (bool, error) {
 	return err != errStatusUnknown, nil
 }
 
-func (c *graphClient) RegisterAutopilotDevice() (*bool, error) {
-	cs, err := Win32CompSys()
+func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error) {
+	cs, err := wmi.Win32CompSys()
 	if err != nil {
 		return nil, err
 	}
-	bios, err := Win32Bios()
+	bios, err := wmi.Win32Bios()
 	if err != nil {
 		return nil, err
 	}
-	mdmInfo, err := MDMDevDetail()
+	mdmInfo, err := wmi.MDMDevDetail()
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +240,7 @@ func (c *graphClient) RegisterAutopilotDevice() (*bool, error) {
 	req, _ := http.NewRequest("POST", "https://graph.microsoft.com/beta/deviceManagement/importedWindowsAutopilotDeviceIdentities/", bytes.NewBuffer(data))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.Do(req)
+	resp, err := c.Do(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +253,7 @@ func (c *graphClient) RegisterAutopilotDevice() (*bool, error) {
 		return nil, err
 	}
 	fmt.Println(identity)
-	registered, err := c.ConfirmRegistered(identity.ID)
+	registered, err := c.ConfirmRegistered(ctx, identity.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -263,74 +262,23 @@ func (c *graphClient) RegisterAutopilotDevice() (*bool, error) {
 
 }
 
-func InitCredential(ctx context.Context, c *CredFlowOptions) (*azcore.AccessToken, error) {
-	credList := []azcore.TokenCredential{}
-	if c.InteractiveCredential {
-		interactive, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
-			TenantID: c.TenantID,
-			ClientID: c.ClientID,
-			// Need to configure as desktop app redirect, not web redirect
-			// See https://github.com/Azure/azure-sdk-for-go/issues/16723#issuecomment-1004271528
-			RedirectURL: "http://localhost:9090",
-		})
-		if err != nil {
-			return nil, err
-		}
-		credList = append(credList, interactive)
-	}
-	// https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/azidentity/device_code_credential.go
-	deviceCode, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
-		TenantID: c.TenantID,
-		ClientID: c.ClientID,
-		// Customizes the UserPrompt. Replaces VerificationURL with shortlink.
-		// Providing a custom UserPrompt can also allow the URL to be rewritten anywhere, instead of just stdout
-		UserPrompt: func(ctx context.Context, deviceCodeMessage azidentity.DeviceCodeMessage) error {
-			msg := strings.Replace(deviceCodeMessage.Message, "https://microsoft.com/devicelogin", "https://aka.ms/devicelogin", 1)
-			fmt.Println(msg)
-			return nil
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	credList = append(credList, deviceCode)
-	chain, err := azidentity.NewChainedTokenCredential(
-		credList,
-		&azidentity.ChainedTokenCredentialOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	token, err := chain.GetToken(ctx, policy.TokenRequestOptions{
-		Scopes:   c.Scopes,
-		TenantID: c.TenantID,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return token, nil
-}
-
 func main() {
-	token, err := InitCredential(
-		context.Background(),
-		&CredFlowOptions{
-			TenantID:              tenantID,
-			ClientID:              clientID,
-			InteractiveCredential: false,
-			Scopes:                scopes,
+	ctx := context.Background()
+	gc, err := NewGraphClient(context.Background(),
+		graphClientOptions{
+			TenantID: tenantID,
+			ClientID: clientID,
+			CredentialOptions: graphCredentialOptions{
+				Interactive: false,
+			},
+			Scopes: scopes,
 		},
 	)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	gc, err := NewGraphClient(*token)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	registered, err := gc.RegisterAutopilotDevice()
+	registered, err := gc.RegisterAutopilotDevice(ctx)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
