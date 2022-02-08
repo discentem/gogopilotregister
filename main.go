@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -28,6 +27,10 @@ import (
 	azidentity "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
+const (
+	DeviceAlreadyAssigned = "ZtdDeviceAlreadyAssigned"
+)
+
 // graphClient lets you interact with MS Graph APIs: https://docs.microsoft.com/en-us/graph/api/overview?view=graph-rest-1.0
 type graphClient struct {
 	httpClient http.Client
@@ -37,7 +40,7 @@ type graphClient struct {
 }
 
 type graphClientOptions struct {
-	Base              string
+	BaseURL           string
 	Vers              string
 	TenantID          string
 	ClientID          string
@@ -128,6 +131,12 @@ func NewGraphClient(ctx context.Context, opts graphClientOptions) (*graphClient,
 		logger.V(2).Info("BrowserSignin = 0")
 
 	}
+	if opts.BaseURL == "" {
+		opts.BaseURL = "https://graph.microsoft.com"
+	}
+	if opts.Vers == "" {
+		opts.Vers = "beta"
+	}
 
 	return &graphClient{
 		httpClient: *http.DefaultClient,
@@ -159,17 +168,30 @@ var (
 	errStatusUnknown = fmt.Errorf("DeviceImportStatus is %q", "unknown")
 )
 
-func (c *graphClient) ConfirmRegistered(ctx context.Context, id string) (bool, error) {
+func (c *graphClient) ConfirmRegistered(ctx context.Context, id string) (*bool, error) {
+	confirmed := false
+	type identityResp struct {
+		ODataContext      string                                      `json:"@odata.context"`
+		ID                string                                      `json:"id"`
+		ProductKey        string                                      `json:"productKey"`
+		SerialNumber      string                                      `json:"serialNumber"`
+		HardwareIdentifer string                                      `json:"hardwareIdentifier"`
+		Model             string                                      `json:"model"`
+		Manufacturer      string                                      `json:"manufacturer"`
+		State             ImportedWindowsAutopilotDeviceIdentityState `json:"state"`
+	}
+
+	var identity identityResp
 	err := retry.Do(
 		func() error {
-			endpoint := fmt.Sprintf("deviceManagement/importedWindowsAutopilotDeviceIdentities/%s", id)
 			url := fmt.Sprintf(
-				"%s/%s/%s",
-				c.options.Base,
+				"%s/%s/%s/%s",
+				c.options.BaseURL,
 				c.options.Vers,
-				endpoint,
+				"deviceManagement/importedWindowsAutopilotDeviceIdentities",
+				id,
 			)
-			fmt.Println(url)
+			logger.V(2).Infof("GET %s", url)
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
 				return errors.Wrapf(err, "crafting GET failed")
@@ -180,24 +202,21 @@ func (c *graphClient) ConfirmRegistered(ctx context.Context, id string) (bool, e
 			if err != nil {
 				return errors.Wrapf(err, "calling c.Do failed")
 			}
+			if resp.StatusCode != 200 {
+				fmt.Println(resp.Status)
+				return errors.New("resp.StatusCode != 200")
+			}
 			body, _ := ioutil.ReadAll(resp.Body)
-			var identity struct {
-				ODataContext      string                                      `json:"@odata.context"`
-				ID                string                                      `json:"id"`
-				ProductKey        string                                      `json:"productKey"`
-				SerialNumber      string                                      `json:"serialNumber"`
-				HardwareIdentifer string                                      `json:"hardwareIdentifier"`
-				Model             string                                      `json:"model"`
-				Manufacturer      string                                      `json:"manufacturer"`
-				State             ImportedWindowsAutopilotDeviceIdentityState `json:"state"`
-			}
 			if err := json.Unmarshal(body, &identity); err != nil {
-				return errors.Wrapf(err, "couldn't unmarhsal to identity")
+				return errors.Wrapf(err, "couldn't unmarshal to identity")
 			}
-			fmt.Println(identity)
+			logger.V(2).Info(identity)
 			if identity.State.DeviceImportStatus == "unknown" || identity.State.DeviceImportStatus == "" {
+				msg := fmt.Sprintf("waiting for %s to be imported...", identity.SerialNumber)
+				logger.Info(msg)
 				return errStatusUnknown
 			}
+			confirmed = true
 			fmt.Println(identity.State.DeviceImportStatus)
 			return nil
 		},
@@ -209,8 +228,16 @@ func (c *graphClient) ConfirmRegistered(ctx context.Context, id string) (bool, e
 			return err == errStatusUnknown
 		}),
 	)
+	if err != nil {
+		return nil, err
+	}
+	if identity.State.DeviceErrorName == DeviceAlreadyAssigned {
+		logger.Info("device is already assigned. proceeding...")
+		confirmed = true
+		return &confirmed, nil
+	}
 
-	return err != errStatusUnknown, nil
+	return &confirmed, nil
 }
 
 func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error) {
@@ -218,14 +245,17 @@ func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error
 	if err != nil {
 		return nil, err
 	}
+	logger.V(3).Info(cs)
 	bios, err := wmi.Win32Bios()
 	if err != nil {
 		return nil, err
 	}
+	logger.V(3).Info(bios)
 	mdmInfo, err := wmi.MDMDevDetail()
 	if err != nil {
 		return nil, err
 	}
+	logger.V(3).Info(mdmInfo)
 	type AutopilotState struct {
 		ODataType            string `json:"@odata.type"`
 		DeviceImportStatus   string `json:"deviceImportStatus"`
@@ -264,9 +294,9 @@ func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error
 		return nil, err
 	}
 	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println(string(body))
-	fmt.Println(resp.StatusCode)
-	fmt.Println(resp.Status)
+	logger.V(3).Info("POST body: ", string(body))
+	logger.V(2).Info("POST statuscode: ", resp.StatusCode)
+	logger.V(2).Info("POST status: ", resp.Status)
 	var identity ImportedWindowsAutopilotDeviceIdentity
 	if err := json.Unmarshal(body, &identity); err != nil {
 		return nil, err
@@ -277,37 +307,42 @@ func (c *graphClient) RegisterAutopilotDevice(ctx context.Context) (*bool, error
 		return nil, err
 	}
 
-	return &registered, nil
+	return registered, nil
 
 }
 
 func main() {
-	logLvl2 := flag.Bool("vv", false, "Sets log level")
+	var (
+		onev  = flag.Bool("v", false, "Sets logger level to 2")
+		twovs = flag.Bool("vv", false, "Sets logger level to 3")
+	)
 	flag.Parse()
 
 	defer logger.Init("gogopilotregister", true, true, ioutil.Discard).Close()
-	if *logLvl2 {
+	if *onev {
 		logger.SetLevel(2)
+	} else if *twovs {
+		logger.SetLevel(3)
 	}
 	ctx := context.Background()
 	gc, err := NewGraphClient(context.Background(),
 		graphClientOptions{
+			// BaseURL:  "https://graph.microsoft.com",
+			// Vers:     "beta",
 			TenantID: tenantID,
 			ClientID: clientID,
 			CredentialOptions: graphCredentialOptions{
-				Interactive: true,
+				Interactive: false,
 			},
 			Scopes: scopes,
 		},
 	)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		logger.Fatal(err)
 	}
 	registered, err := gc.RegisterAutopilotDevice(ctx)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		logger.Fatal(err)
 	}
 	fmt.Printf("Success? %v", *registered)
 
